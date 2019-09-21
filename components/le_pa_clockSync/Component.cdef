@@ -1,0 +1,18 @@
+sources:
+{
+    pa_clkSync_linux.c
+}
+
+requires:
+{
+    api:
+    {
+        le_clkSync.api  [types-only]
+        le_dcs.api      [types-only]
+    }
+}
+
+cflags:
+{
+    -I$LEGATO_ROOT/components/clockService/platformAdaptor/inc
+}
