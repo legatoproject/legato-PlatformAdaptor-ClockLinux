@@ -19,6 +19,30 @@
 #define MAX_SYSTEM_CMD_OUTPUT_LENGTH 1024
 
 
+
+//--------------------------------------------------------------------------------------------------
+// Data structures
+//--------------------------------------------------------------------------------------------------
+
+//--------------------------------------------------------------------------------------------------
+/**
+ * Typedef of the protocol-specific function vector for parsing the output line of a retrieved
+ * clock time from a time server
+ *
+ * @return
+ *     - LE_BAD_PARAMETER: invalid inputs
+ *     - LE_NOT_FOUND: valid result not found
+ *     - LE_FAULT: failure to parse output
+ *     - LE_OK: output successfully parsed & retrieved
+ */
+//--------------------------------------------------------------------------------------------------
+typedef le_result_t (*ClkSync_ProtocolParserFunc_t)
+(
+    char *output,           ///< [IN] the output line to be parsed
+    struct tm* timePtr      ///< [OUT] pointer to the time struct holding the parsed results
+);
+
+
 //--------------------------------------------------------------------------------------------------
 /**
  * Validate a char string as an IPv4/v6 address or not
@@ -89,6 +113,114 @@ static le_result_t ResolveIpAddress
 
 //--------------------------------------------------------------------------------------------------
 /**
+ * This is the vector function for the Time Protocol (TP) for parsing its output line for the
+ * returned clock time.
+ *
+ * @return
+ *     - LE_BAD_PARAMETER: invalid inputs
+ *     - LE_FAULT: failure to parse output
+ *     - LE_OK: output successfully parsed & retrieved
+ */
+//--------------------------------------------------------------------------------------------------
+static le_result_t TpParseOutput
+(
+    char *output,
+    struct tm* timePtr
+)
+{
+    if (!output || !timePtr)
+    {
+        LE_ERROR("Input error");
+        return LE_BAD_PARAMETER;
+    }
+
+    if (!strptime(output, "%a %b %d %H:%M:%S %Y", timePtr))
+    {
+        LE_ERROR("Failed to retrieve return clock time");
+        return LE_FAULT;
+    }
+
+    LE_DEBUG("TP present time retrieved: %d/%d/%d %d:%d:%d",
+             timePtr->tm_year + 1900, timePtr->tm_mon + 1, timePtr->tm_mday,
+             timePtr->tm_hour, timePtr->tm_min, timePtr->tm_sec);
+    return LE_OK;
+}
+
+
+//--------------------------------------------------------------------------------------------------
+/**
+ * This is the vector function for the Network Time Protocol (NTP) for parsing its output line for
+ * the returned clock time. Note that the NTP returned time is an offset of the device's system
+ * time from the NTP server's given UTC time. Thus, this function needs to calculate the returned
+ * UTC time by adding the offset to the device's system time, and return this back to its caller.
+ *
+ * @return
+ *     - LE_BAD_PARAMETER: invalid inputs
+ *     - LE_NOT_FOUND: valid result not found
+ *     - LE_OK: output successfully parsed & retrieved
+ */
+//--------------------------------------------------------------------------------------------------
+static le_result_t NtpParseOutput
+(
+    char *output,
+    struct tm* currentTimePtr
+)
+{
+    time_t offSetSecs = 0;
+    le_clk_Time_t currentAbsTime;
+    char *searchPtr, *stringEnd, *offSetString = "offset ", *offSetUnitString = " sec";
+
+    if (!output || !currentTimePtr)
+    {
+        LE_ERROR("Input error");
+        return LE_BAD_PARAMETER;
+    }
+
+    // Output of the ntpdate command in LXSWI looks like the following example which gives the
+    // NTP offset of the present clock time on the device:
+    // 1 Jan 07:33:20 ntpdate[29329]: step time server 5.196.160.139 offset 1558374338.202418 sec
+    // i.e. 1558374338.202418 sec from 1 Jan 07:33:20 1971
+    searchPtr = strstr(output, "ntpdate");
+    if (!searchPtr)
+    {
+        return LE_NOT_FOUND;
+    }
+
+    searchPtr = strstr(output, offSetString);
+    if (!searchPtr)
+    {
+        return LE_NOT_FOUND;
+    }
+    searchPtr += strlen(offSetString);
+    stringEnd = strstr(searchPtr, offSetUnitString);
+    if (!stringEnd)
+    {
+        return LE_NOT_FOUND;
+    }
+
+    *stringEnd = '\0';
+    // After the above, searchPtr is a char* with content 1558374338.202418 in the above example
+    offSetSecs = strtol(searchPtr, NULL, 10);
+    LE_DEBUG("NTP offset time retrieved: %ld secs", (long int)offSetSecs);
+
+    // Get the present clock time on the device
+    currentAbsTime = le_clk_GetAbsoluteTime();
+    LE_DEBUG("Device present absolute time: %ld", (long int)currentAbsTime.sec);
+
+    // Add the offset to the present clock time to get the NTP provided present time
+    // In the above example, it's to add 1558374338 secs to 1 Jan 07:33:20 1971
+    offSetSecs += currentAbsTime.sec;
+    LE_DEBUG("NTP present absolute time: %ld secs", (long int)offSetSecs);
+    localtime_r(&offSetSecs, currentTimePtr);
+    LE_DEBUG("NTP present time retrieved: %d/%d/%d %d:%d:%d",
+             currentTimePtr->tm_year + 1900, currentTimePtr->tm_mon + 1, currentTimePtr->tm_mday,
+             currentTimePtr->tm_hour, currentTimePtr->tm_min, currentTimePtr->tm_sec);
+    return LE_OK;
+}
+
+
+//--------------------------------------------------------------------------------------------------
+/**
  * Retrieve current clock time using the given Linux protocol specific server command in which,
  * and also in the 1st input argument a particular server is specified. The 2nd input argument
  * specifies if this operation is to only get the time or to get it & set it into the system clock.
@@ -108,6 +240,7 @@ static le_result_t pa_clkSync_GetTimeFromServer
     const char* serverStrPtr,        ///< [IN]  Time server name or address
     bool getOnly,                    ///< [IN]  Get the time acquired without updating system clock
     char* protocolCommand,           ///< [IN]  Protocol dependent command to run, i.e. TP or NTP
+    ClkSync_ProtocolParserFunc_t parseFunc, ///< [IN]  Parsing function for protocol's output line
     le_clkSync_ClockTime_t* timePtr  ///< [OUT] Time structure
 )
 {
@@ -153,9 +286,9 @@ static le_result_t pa_clkSync_GetTimeFromServer
         // Retrieve output
         struct tm tm = {0};
         result = LE_FAULT;
-        while ((NULL != fgets(output, sizeof(output)-1, fp)) && (LE_OK != result))
+        while (NULL != fgets(output, sizeof(output)-1, fp))
         {
-            if (NULL != strptime(output, "%a %b %d %H:%M:%S %Y", &tm))
+            if (parseFunc && (parseFunc(output, &tm) == LE_OK))
             {
                 timePtr->msec = 0;
                 timePtr->sec  = tm.tm_sec;
@@ -165,7 +298,12 @@ static le_result_t pa_clkSync_GetTimeFromServer
                 timePtr->mon  = 1 + tm.tm_mon; // Convert month range to [1..12]
                 timePtr->year = 1900 + tm.tm_year;
                 result = LE_OK;
+                break;
             }
+        }
+        if (result != LE_OK)
+        {
+            LE_ERROR("Failed to get time from server %s", serverStrPtr);
         }
     }
     else
@@ -228,7 +366,8 @@ le_result_t pa_clkSync_GetTimeWithTimeProtocol
                  "/usr/sbin/rdate %s >& /dev/null; echo $?", serverStrPtr);
     }
 
-    result = pa_clkSync_GetTimeFromServer(serverStrPtr, getOnly, protocolCommand, timePtr);
+    result = pa_clkSync_GetTimeFromServer(serverStrPtr, getOnly, protocolCommand,
+                                          TpParseOutput, timePtr);
     return result;
 }
 
@@ -258,17 +397,17 @@ le_result_t pa_clkSync_GetTimeWithNetworkTimeProtocol
 
     if (getOnly)
     {
-        memset(timePtr, 0, sizeof(le_clkSync_ClockTime_t));
-        LE_ERROR("Unsupported to only get clock time from NTP without setting it into system");
-        return LE_UNSUPPORTED;
+        snprintf(protocolCommand, sizeof(protocolCommand),
+                 "/usr/sbin/ntpdate -t 1.0 -p 1 -q %s; echo $?", serverStrPtr);
     }
     else
     {
         snprintf(protocolCommand, sizeof(protocolCommand),
-                 "/usr/sbin/ntpd -n -q -p %s >& /dev/null; echo $?", serverStrPtr);
+                 "/usr/sbin/ntpdate -t 1.0 -p 1 %s >& /dev/null; echo $?", serverStrPtr);
     }
 
-    result = pa_clkSync_GetTimeFromServer(serverStrPtr, getOnly, protocolCommand, timePtr);
+    result = pa_clkSync_GetTimeFromServer(serverStrPtr, getOnly, protocolCommand,
+                                          NtpParseOutput, timePtr);
     return result;
 }
 
